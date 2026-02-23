@@ -2,10 +2,15 @@ const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
-const Redis = require("ioredis");
+const dotenv = require("dotenv");
+const path = require("path");
+
+dotenv.config({ path: path.resolve(__dirname, ".env") });
+dotenv.config({ path: path.resolve(__dirname, "../roconal/.env") });
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
+app.use(express.json({ limit: "256kb" }));
 
 const server = http.createServer(app);
 
@@ -14,15 +19,13 @@ const io = new Server(server, {
   transports: ["websocket", "polling"], // Socket.IO fallback
 });
 
-const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-const CHANNEL =
-  process.env.REALTIME_REDIS_CHANNEL ||
-  process.env.REDIS_CHANNEL ||
-  "roconal_database_realtime";
-const REDIS_PREFIX = process.env.REDIS_PREFIX || "";
+const INTERNAL_TOKEN = process.env.REALTIME_INTERNAL_TOKEN || "";
 
-// Redis subscriber (ambil pesan dari Laravel)
-const redisSub = new Redis(REDIS_URL);
+if (!INTERNAL_TOKEN) {
+  console.warn(
+    "⚠️ REALTIME_INTERNAL_TOKEN is empty. Internal publish endpoint is not protected.",
+  );
+}
 
 io.on("connection", (socket) => {
   // contoh join room berdasarkan user_id dari token (nanti auth)
@@ -40,77 +43,57 @@ io.on("connection", (socket) => {
   });
 });
 
-redisSub.on("connect", () => console.log("✅ Redis connected"));
-redisSub.on("ready", () => console.log("✅ Redis ready"));
-redisSub.on("error", (e) => console.log("❌ Redis error:", e.message));
-redisSub.on("close", () => console.log("⚠️ Redis connection closed"));
-
-redisSub.on("message", (channel, message) => {
-  try {
-    const payload = JSON.parse(message);
-    if (!payload?.event) return;
-
-    console.log("[realtime] message", {
-      channel,
-      event: payload.event,
-      room: payload.room || null,
-    });
-
-    if (payload.room) {
-      io.to(payload.room).emit(payload.event, payload.data || {});
-    } else {
-      io.emit(payload.event, payload.data || {});
-    }
-  } catch (e) {
-    console.error("Invalid message:", message);
+function emitRealtime(payload = {}) {
+  const event = payload?.event;
+  if (!event || typeof event !== "string") {
+    return false;
   }
+
+  if (payload.room && typeof payload.room === "string") {
+    io.to(payload.room).emit(event, payload.data || {});
+  } else {
+    io.emit(event, payload.data || {});
+  }
+
+  return true;
+}
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "realtime-server" });
 });
 
-redisSub.on("pmessage", (pattern, channel, message) => {
-  try {
-    const payload = JSON.parse(message);
-    if (!payload?.event) return;
+app.post("/internal/events", (req, res) => {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
 
-    console.log("[realtime] pmessage", {
-      pattern,
-      channel,
-      event: payload.event,
-      room: payload.room || null,
-    });
-
-    if (payload.room) {
-      io.to(payload.room).emit(payload.event, payload.data || {});
-    } else {
-      io.emit(payload.event, payload.data || {});
-    }
-  } catch (e) {
-    console.error("Invalid pmessage:", message);
+  if (INTERNAL_TOKEN && token !== INTERNAL_TOKEN) {
+    return res.status(401).json({ ok: false, message: "Unauthorized" });
   }
+
+  const payload = req.body || {};
+  const ok = emitRealtime(payload);
+
+  if (!ok) {
+    return res.status(422).json({
+      ok: false,
+      message: "Invalid payload. Field `event` is required.",
+    });
+  }
+
+  console.log("[realtime] internal event", {
+    event: payload.event,
+    room: payload.room || null,
+  });
+
+  return res.json({ ok: true });
 });
 
-const channels = Array.from(
-  new Set(
-    [CHANNEL, REDIS_PREFIX ? `${REDIS_PREFIX}${CHANNEL}` : null].filter(
-      Boolean,
-    ),
-  ),
-);
-
-redisSub.subscribe(...channels, (err, count) => {
-  if (err) {
-    console.error("Redis subscribe error:", err);
+app.use((err, _req, res, _next) => {
+  console.error("Realtime server error:", err?.message || err);
+  if (res.headersSent) {
     return;
   }
-  console.log("Subscribed channels:", channels, "count:", count);
-});
-
-// Safety-net: tangkap publish dengan prefix channel apapun yang berakhiran nama channel utama.
-redisSub.psubscribe(`*${CHANNEL}`, (err, count) => {
-  if (err) {
-    console.error("Redis psubscribe error:", err);
-    return;
-  }
-  console.log("Pattern subscribed:", `*${CHANNEL}`, "count:", count);
+  res.status(500).json({ ok: false, message: "Internal server error" });
 });
 
 server.listen(process.env.PORT || 3001, () => {
